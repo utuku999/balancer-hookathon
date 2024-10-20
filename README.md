@@ -52,6 +52,16 @@ $ forge build
 $ forge test
 ```
 
+Force compiler:
+
+```shell
+$ forge compile --evm-version cancun --force
+
+$ forge build --evm-version cancun --force
+
+$ forge test --evm-version cancun --force
+```
+
 ```shell
 
 $ forge create --rpc-url <your_rpc_url> --private-key <your_private_key> src/MyContract.sol:MyContract

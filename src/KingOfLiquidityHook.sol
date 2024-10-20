@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "./Epoch.sol";
 import {BaseHooks} from "@balancer-labs/v3-vault/contracts/BaseHooks.sol";
 import {IVault} from "@balancer-labs/v3-interfaces/contracts/vault/IVault.sol";
 import {TokenConfig, LiquidityManagement, HookFlags, AddLiquidityKind, RemoveLiquidityKind, AfterSwapParams, SwapKind} from "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
@@ -17,13 +18,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  * @title King Of Liquidity Hook
  * @notice Tracks and rewards top liquidity providers periodically
  */
-contract KingOfLiquidityHook is BaseHooks, VaultGuard, Ownable {
+contract KingOfLiquidityHook is BaseHooks, VaultGuard, Epoch, Ownable {
     using FixedPoint for uint256;
     using SafeERC20 for IERC20;
     using EnumerableMap for EnumerableMap.IERC20ToUint256Map;
-
-    address private immutable _allowedFactory;
-    address private immutable _trustedRouter;
 
     struct LiquidityProvider {
         uint256 totalLiquidity;
@@ -31,40 +29,40 @@ contract KingOfLiquidityHook is BaseHooks, VaultGuard, Ownable {
         uint256 timeWeightedLiquidity;
     }
 
-    mapping(address user => LiquidityProvider) public liquidityProviders;
-    address[] public providerAddresses;
+    address private immutable _allowedFactory;
+    address private immutable _trustedRouter;
 
-    uint64 public swapFeePercentage;
+    uint256 public swapFeePercentage;
 
-    uint256 public DISTRIBUTION_PERIOD = 7 days; // Example: 7 days = 604800 seconds.
-    uint256 public constant TOP_CONTRIBUTORS_COUNT = 3; // Example: Reward top 3 contributors.
-    uint256 public lastDistributionTime;
-    uint256 public epochs;
-
-    // Map of tokens with accrued fees.
     EnumerableMap.IERC20ToUint256Map private _tokensWithAccruedFees;
 
-    event FeesCollected(address indexed swapper, IERC20 token, uint256 fee);
+    mapping(address user => mapping(uint256 epoch => LiquidityProvider))
+        public liquidityProviders;
+    address public kingOfLiquidity;
+
+    event FeesCollected(
+        address indexed swapper,
+        IERC20 indexed token,
+        uint256 fee
+    );
     event RewardsDistributed(
         address indexed winner,
-        IERC20 token,
+        IERC20 indexed token,
         uint256 amount
     );
     event LiquidityAdded(address indexed provider, uint256 amount);
     event LiquidityRemoved(address indexed provider, uint256 amount);
+    event KingUpdated(address indexed king);
 
     constructor(
         IVault vault,
         address allowedFactory,
         address trustedRouter,
-        uint64 newSwapFeePercentage,
-        uint256 newDistributionPeriod
+        uint256 hookSwapFeePercentage
     ) VaultGuard(vault) Ownable(msg.sender) {
         _allowedFactory = allowedFactory;
         _trustedRouter = trustedRouter;
-        swapFeePercentage = newSwapFeePercentage;
-        DISTRIBUTION_PERIOD = newDistributionPeriod;
-        lastDistributionTime = block.timestamp; // Start counting from now on
+        swapFeePercentage = hookSwapFeePercentage;
     }
 
     // Return true to allow pool registration or false to revert
@@ -112,8 +110,9 @@ contract KingOfLiquidityHook is BaseHooks, VaultGuard, Ownable {
             return (true, amountsInRaw);
         }
 
-        _updateLiquidityProvider(router, bptAmountOut, true);
         _tryRewardAndStartNewEpoch();
+        _updateLiquidityProvider(router, bptAmountOut, true);
+
         return (true, amountsInRaw);
     }
 
@@ -139,6 +138,7 @@ contract KingOfLiquidityHook is BaseHooks, VaultGuard, Ownable {
 
         _tryRewardAndStartNewEpoch();
         _updateLiquidityProvider(router, bptAmountIn, false);
+
         return (true, hookAdjustedAmountsOutRaw);
     }
 
@@ -216,15 +216,16 @@ contract KingOfLiquidityHook is BaseHooks, VaultGuard, Ownable {
         uint256 amount,
         bool isAdding
     ) internal {
+        uint256 epoch = getCurrentEpoch();
+
         address provider = IRouterCommon(router).getSender();
-        LiquidityProvider storage lp = liquidityProviders[provider];
+        LiquidityProvider storage lp = liquidityProviders[provider][epoch];
 
-        if (lp.totalLiquidity == 0 && isAdding) {
-            providerAddresses.push(provider);
+        if (lp.lastUpdateTime == 0) {
             lp.lastUpdateTime = block.timestamp;
+        } else {
+            _updateTimeWeightedLiquidity(lp);
         }
-
-        _updateTimeWeightedLiquidity(lp);
 
         if (isAdding) {
             lp.totalLiquidity += amount;
@@ -235,129 +236,86 @@ contract KingOfLiquidityHook is BaseHooks, VaultGuard, Ownable {
                 : 0;
             emit LiquidityRemoved(provider, amount);
         }
+
+        _updateKingOfLp(provider, epoch, lp);
     }
 
     function _updateTimeWeightedLiquidity(
         LiquidityProvider storage lp
     ) internal {
         uint256 timePassed = block.timestamp - lp.lastUpdateTime;
-        lp.timeWeightedLiquidity += lp.totalLiquidity * timePassed;
-        lp.lastUpdateTime = block.timestamp;
+
+        if (timePassed > 0) {
+            lp.timeWeightedLiquidity += lp.totalLiquidity * timePassed;
+            lp.lastUpdateTime = block.timestamp;
+        }
     }
 
-    function _epochHasEnded() internal view returns (bool) {
-        return block.timestamp >= lastDistributionTime + DISTRIBUTION_PERIOD;
+    function _updateKingOfLp(
+        address sender,
+        uint256 epoch,
+        LiquidityProvider memory lp
+    ) internal {
+        if (kingOfLiquidity != address(0)) {
+            LiquidityProvider storage kingLP = liquidityProviders[
+                kingOfLiquidity
+            ][epoch];
+
+            _updateTimeWeightedLiquidity(kingLP); // making sure the old king has up to date values to compare
+
+            if (lp.timeWeightedLiquidity > kingLP.timeWeightedLiquidity) {
+                kingOfLiquidity = sender;
+                emit KingUpdated(sender);
+            }
+        } else {
+            kingOfLiquidity = sender;
+            emit KingUpdated(sender);
+        }
     }
 
     function _tryRewardAndStartNewEpoch() internal {
-        if (!_epochHasEnded()) return;
+        if (!isNewEpoch()) return;
 
-        address[TOP_CONTRIBUTORS_COUNT] memory topProviders = _getTopLPs();
-        _distributeRewards(topProviders);
+        _distributeRewards();
 
-        _resetState();
+        delete kingOfLiquidity;
+        emit KingUpdated(address(0));
+
+        startNewEpoch();
     }
 
-    function getProviderInfo(
-        address providerAddress
-    ) external view returns (uint256, uint256) {
-        LiquidityProvider storage provider = liquidityProviders[
-            providerAddress
-        ];
-        return (provider.totalLiquidity, provider.timeWeightedLiquidity);
-    }
+    function _distributeRewards() internal {
+        if (kingOfLiquidity == address(0)) {
+            return;
+        }
 
-    function _distributeRewards(
-        address[TOP_CONTRIBUTORS_COUNT] memory topProviders
-    ) internal {
         // Iterating backwards is more efficient, since the last element is removed from the map on each iteration.
         for (uint256 i = _tokensWithAccruedFees.size; i > 0; i--) {
             (IERC20 feeToken, ) = _tokensWithAccruedFees.at(i - 1);
             _tokensWithAccruedFees.remove(feeToken);
+
             uint256 amount = feeToken.balanceOf(address(this));
+
             if (amount > 0) {
-                for (uint256 j = 0; j < TOP_CONTRIBUTORS_COUNT; j++) {
-                    if (topProviders[j] != address(0)) {
-                        uint256 reward = amount / TOP_CONTRIBUTORS_COUNT; // Distribute equally
-                        feeToken.safeTransfer(topProviders[j], reward);
-                        emit RewardsDistributed(
-                            topProviders[j],
-                            feeToken,
-                            reward
-                        );
-                    }
-                }
+                feeToken.safeTransfer(kingOfLiquidity, amount);
+                emit RewardsDistributed(kingOfLiquidity, feeToken, amount);
             }
         }
     }
 
-    function _resetState() internal {
-        // Reset state (start a new epoch)
-        for (uint256 i = 0; i < providerAddresses.length; i++) {
-            address adr = providerAddresses[i];
-            liquidityProviders[adr].timeWeightedLiquidity = 0;
-            liquidityProviders[adr].totalLiquidity = 0;
-            liquidityProviders[adr].lastUpdateTime = block.timestamp;
-        }
-        lastDistributionTime = block.timestamp;
-        epochs++;
+    function getProviderInfo(
+        address providerAddress
+    ) public view returns (uint256, uint256) {
+        return getProviderInfo(providerAddress, getCurrentEpoch());
     }
 
-    function _getTopLPs()
-        internal
-        view
-        returns (address[TOP_CONTRIBUTORS_COUNT] memory)
-    {
-        address[TOP_CONTRIBUTORS_COUNT] memory topProviders;
-        uint256[TOP_CONTRIBUTORS_COUNT] memory topAmounts;
-
-        for (uint i = 0; i < providerAddresses.length; i++) {
-            address lpAddress = providerAddresses[i];
-            uint256 amount = liquidityProviders[lpAddress]
-                .timeWeightedLiquidity;
-
-            for (uint j = 0; j < TOP_CONTRIBUTORS_COUNT; j++) {
-                if (amount > topAmounts[j]) {
-                    for (uint k = TOP_CONTRIBUTORS_COUNT - 1; k > j; k--) {
-                        topAmounts[k] = topAmounts[k - 1];
-                        topProviders[k] = topProviders[k - 1];
-                    }
-                    topAmounts[j] = amount;
-                    topProviders[j] = lpAddress;
-                    break;
-                }
-            }
-        }
-
-        return topProviders;
-    }
-
-    function getTopLPs()
-        external
-        view
-        returns (address[TOP_CONTRIBUTORS_COUNT] memory)
-    {
-        return _getTopLPs();
-    }
-
-    function getTimeUntilNextDistribution() external view returns (uint256) {
-        uint256 nextDistributionTime = lastDistributionTime +
-            DISTRIBUTION_PERIOD;
-        return
-            block.timestamp < nextDistributionTime
-                ? nextDistributionTime - block.timestamp
-                : 0;
-    }
-
-    function setHookSwapFeePercentage(
-        uint64 newSwapFeePercentage
-    ) external onlyOwner {
-        swapFeePercentage = newSwapFeePercentage;
-    }
-
-    function setDistributionPeriod(
-        uint256 newDistributionPeriod
-    ) external onlyOwner {
-        DISTRIBUTION_PERIOD = newDistributionPeriod;
+    function getProviderInfo(
+        address providerAddress,
+        uint256 epoch
+    ) public view returns (uint256, uint256) {
+        LiquidityProvider memory provider = liquidityProviders[providerAddress][
+            epoch
+        ];
+        return (provider.totalLiquidity, provider.timeWeightedLiquidity);
     }
 }
