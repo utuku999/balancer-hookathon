@@ -11,6 +11,7 @@ contract Epoch {
     constructor() {
         startTime = block.timestamp;
         currentEpoch = 0;
+        emit NewEpochStarted(currentEpoch, startTime);
     }
 
     function getCurrentEpoch() public view returns (uint256) {
