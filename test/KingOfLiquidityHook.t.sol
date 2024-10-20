@@ -75,6 +75,56 @@ contract KingOfLiquidityHookTest is BaseVaultTest {
         _registerPoolWithHook(testPool, tokenConfig, unauthorizedFactory);
     }
 
+    function testCreationWithWrongFactory() public {
+        address testPool = _createPoolToRegister();
+        TokenConfig[] memory tokenConfig = vault.buildTokenConfig(
+            [address(dai), address(usdc)].toMemoryArray().asIERC20()
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IVaultErrors.HookRegistrationFailed.selector,
+                poolHooksContract,
+                testPool,
+                address(factoryMock)
+            )
+        );
+        _registerPoolWithHook(testPool, tokenConfig, address(factoryMock));
+    }
+
+    function testSuccessfulRegistry() public {
+        // Register with the allowed factory.
+        address testPool = factoryMock.createPool("Test Pool", "TEST");
+        TokenConfig[] memory tokenConfig = vault.buildTokenConfig(
+            [address(dai), address(usdc)].toMemoryArray().asIERC20()
+        );
+
+        _registerPoolWithHook(testPool, tokenConfig, address(factoryMock));
+
+        HooksConfig memory hooksConfig = vault.getHooksConfig(testPool);
+
+        assertEq(
+            hooksConfig.hooksContract,
+            poolHooksContract,
+            "Wrong poolHooksContract"
+        );
+        assertEq(
+            hooksConfig.shouldCallAfterAddLiquidity,
+            true,
+            "shouldCallAfterAddLiquidity is false"
+        );
+        assertEq(
+            hooksConfig.shouldCallAfterRemoveLiquidity,
+            true,
+            "shouldCallAfterRemoveLiquidity is false"
+        );
+        assertEq(
+            hooksConfig.shouldCallAfterSwap,
+            true,
+            "shouldCallAfterSwap is false"
+        );
+    }
+
     // Registry tests require a new pool, because an existing pool may be already registered
     function _createPoolToRegister() private returns (address newPool) {
         newPool = address(
