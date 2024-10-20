@@ -5,12 +5,15 @@ pragma solidity ^0.8.24;
 import "forge-std/Test.sol";
 
 import {IVault} from "@balancer-labs/v3-interfaces/contracts/vault/IVault.sol";
+import {IHooks} from "@balancer-labs/v3-interfaces/contracts/vault/IHooks.sol";
 import {BaseVaultTest} from "@balancer-labs/v3-vault/test/foundry/utils/BaseVaultTest.sol";
 import {PoolMock} from "@balancer-labs/v3-vault/contracts/test/PoolMock.sol";
-import {HooksConfig, LiquidityManagement, PoolRoleAccounts, TokenConfig} from "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
+import {HooksConfig, LiquidityManagement, PoolRoleAccounts, TokenConfig, AddLiquidityKind} from "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
 import {IVaultAdmin} from "@balancer-labs/v3-interfaces/contracts/vault/IVaultAdmin.sol";
 import {IVaultErrors} from "@balancer-labs/v3-interfaces/contracts/vault/IVaultErrors.sol";
 import {PoolFactoryMock} from "@balancer-labs/v3-vault/contracts/test/PoolFactoryMock.sol";
+import {BasePoolMath} from "@balancer-labs/v3-vault/contracts/BasePoolMath.sol";
+import {BalancerPoolToken} from "@balancer-labs/v3-vault/contracts/BalancerPoolToken.sol";
 import {FixedPoint} from "@balancer-labs/v3-solidity-utils/contracts/math/FixedPoint.sol";
 import {ArrayHelpers} from "@balancer-labs/v3-solidity-utils/contracts/test/ArrayHelpers.sol";
 import {CastingHelpers} from "@balancer-labs/v3-solidity-utils/contracts/helpers/CastingHelpers.sol";
@@ -26,6 +29,8 @@ contract KingOfLiquidityHookTest is BaseVaultTest {
     uint256 internal daiIdx;
     uint256 internal usdcIdx;
 
+    uint256 private constant SWAP_FEE_PERCENTAGE = 1e16; // 1%
+
     function setUp() public override {
         super.setUp();
 
@@ -36,13 +41,12 @@ contract KingOfLiquidityHookTest is BaseVaultTest {
         trustedRouter = payable(router);
 
         vm.prank(lp);
-        uint64 fee = 10;
         address customHook = address(
             new KingOfLiquidityHook(
                 IVault(address(vault)),
                 address(factoryMock),
                 trustedRouter,
-                fee
+                SWAP_FEE_PERCENTAGE
             )
         );
         vm.label(customHook, "Custom Hook");
@@ -122,6 +126,110 @@ contract KingOfLiquidityHookTest is BaseVaultTest {
             hooksConfig.shouldCallAfterSwap,
             true,
             "shouldCallAfterSwap is false"
+        );
+    }
+
+    function testInitialState() public {
+        assertEq(
+            KingOfLiquidityHook(poolHooksContract).getCurrentEpoch(),
+            0,
+            "Should start with 0 epoch"
+        );
+        assertEq(
+            KingOfLiquidityHook(poolHooksContract).kingOfLiquidity(),
+            address(0),
+            "Should start with no initial king"
+        );
+        assertEq(
+            KingOfLiquidityHook(poolHooksContract).swapFeePercentage(),
+            SWAP_FEE_PERCENTAGE,
+            "Should have correct swap fee"
+        );
+
+        (
+            uint256 totalLiquidity,
+            uint256 timeWeightedLiquidity
+        ) = KingOfLiquidityHook(poolHooksContract).getProviderInfo(bob);
+        assertEq(totalLiquidity, 0, "Should start with 0 total liquidity");
+        assertEq(
+            timeWeightedLiquidity,
+            0,
+            "Should start with 0 time wighted liquidity"
+        );
+    }
+
+    function testAfterAddLiquidity() public {
+        uint256[] memory actualAmountsIn = BasePoolMath
+            .computeProportionalAmountsIn(
+                [poolInitAmount, poolInitAmount].toMemoryArray(),
+                BalancerPoolToken(pool).totalSupply(),
+                bptAmount
+            );
+
+        uint256 daiAmount = actualAmountsIn[daiIdx];
+        uint256 usdcAmount = actualAmountsIn[usdcIdx];
+
+        uint256[] memory maxAmountsIn = [daiAmount, usdcAmount].toMemoryArray();
+
+        BaseVaultTest.Balances memory balancesBefore = getBalances(bob);
+
+        uint256[] memory expectedBalances = [
+            poolInitAmount + daiAmount,
+            poolInitAmount + usdcAmount
+        ].toMemoryArray();
+
+        vm.expectCall(
+            address(poolHooksContract),
+            abi.encodeCall(
+                IHooks.onAfterAddLiquidity,
+                (
+                    address(router),
+                    pool,
+                    AddLiquidityKind.PROPORTIONAL,
+                    actualAmountsIn,
+                    actualAmountsIn,
+                    bptAmount,
+                    expectedBalances,
+                    bytes("")
+                )
+            )
+        );
+
+        vm.prank(bob);
+        router.addLiquidityProportional(
+            pool,
+            maxAmountsIn,
+            bptAmount,
+            false,
+            bytes("")
+        );
+
+        assertEq(
+            KingOfLiquidityHook(poolHooksContract).kingOfLiquidity(),
+            bob,
+            "Should set a king after liquidity provision"
+        );
+
+        // Capture Bob's token balances after adding liquidity
+        BaseVaultTest.Balances memory balancesAfter = getBalances(bob);
+
+        // Assert that Bob's DAI balance has decreased by the correct amount
+        assertEq(
+            balancesAfter.userTokens[daiIdx],
+            balancesBefore.userTokens[daiIdx] - daiAmount,
+            "User's DAI balance did not decrease correctly"
+        );
+        // Assert that Bob's USDC balance has decreased by the correct amount
+        assertEq(
+            balancesAfter.userTokens[usdcIdx],
+            balancesBefore.userTokens[usdcIdx] - usdcAmount,
+            "User's USDC balance did not decrease correctly"
+        );
+        // Assert that Bob received the expected amount of BPT tokens
+        assertEq(
+            balancesAfter.userBpt,
+            balancesBefore.userBpt + bptAmount,
+            "User did not receive the correct amount of BPT"
         );
     }
 
