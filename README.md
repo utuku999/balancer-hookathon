@@ -2,6 +2,14 @@
 
 ### V3
 
+Submission:
+
+[Submission Text](submission.md)
+
+[Pull Request](https://github.com/balancer/scaffold-balancer-v3/pull/111)
+
+---
+
 https://balancer.fi/
 
 Run the commands using Git Bash terminal.
